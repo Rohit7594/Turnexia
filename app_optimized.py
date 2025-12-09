@@ -3,12 +3,63 @@ from dash import html, dcc, Input, Output, State
 import dash_bootstrap_components as dbc
 import pandas as pd
 import yfinance as yf
-from functools import lru_cache
 from datetime import datetime
 from nsepython import nse_eq
 import time
 from dash.dependencies import ALL
 import plotly.graph_objects as go
+import json
+import logging
+import os
+from cachetools import TTLCache, cached
+import pytz
+
+# ===================================================================
+# CONFIGURATION CONSTANTS
+# ===================================================================
+TRADING_DAYS_BUFFER = 10          # Extra days to fetch for weekends/holidays
+CRORE_DIVISOR = 10_000_000        # 1 Crore = 10 million
+DEFAULT_BATCH_SIZE = 50           # Stocks per batch
+DEFAULT_WORKERS = 5               # Concurrent threads
+CACHE_TTL_SECONDS = 300           # 5 minutes
+CACHE_MAX_SIZE = 256              # Max cached items
+
+# Volume significance thresholds
+VOL_ELEVATED_THRESHOLD = 1.20     # 20% above average = elevated
+VOL_REDUCED_THRESHOLD = 0.80      # 20% below average = reduced
+
+# Market hours (IST)
+MARKET_OPEN_HOUR = 9
+MARKET_OPEN_MINUTE = 15
+MARKET_CLOSE_HOUR = 15
+MARKET_CLOSE_MINUTE = 30
+
+# Timezone
+IST = pytz.timezone('Asia/Kolkata')
+
+# Intraday volume distribution (cumulative expected % by time)
+# Based on typical Indian market volume patterns
+INTRADAY_VOL_DISTRIBUTION = {
+    (9, 15): 0.00, (9, 30): 0.05, (9, 45): 0.10, (10, 0): 0.15,
+    (10, 15): 0.19, (10, 30): 0.23, (10, 45): 0.27, (11, 0): 0.31,
+    (11, 15): 0.35, (11, 30): 0.38, (11, 45): 0.41, (12, 0): 0.44,
+    (12, 15): 0.47, (12, 30): 0.50, (12, 45): 0.53, (13, 0): 0.56,
+    (13, 15): 0.59, (13, 30): 0.62, (13, 45): 0.65, (14, 0): 0.69,
+    (14, 15): 0.73, (14, 30): 0.78, (14, 45): 0.84, (15, 0): 0.91,
+    (15, 15): 0.96, (15, 30): 1.00,
+}
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ===================================================================
+# TTL CACHES (Auto-expire after 5 minutes)
+# ===================================================================
+nse_data_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
+fundamentals_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
+historical_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
+volume_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
 
 # -------------------------------------------------------------------
 # SAFETY WRAPPER
@@ -55,9 +106,14 @@ def retry_with_backoff(func, symbol: str, max_retries: int = 3, base_delay: floa
 # -------------------------------------------------------------------
 # 1) Load pre-generated symbol-industry mapping (FAST!)
 # -------------------------------------------------------------------
-@lru_cache(maxsize=1)
+# Using simple caching for static data (no TTL needed - file doesn't change)
+_symbol_industry_cache = {}
+
 def load_symbols_with_industries():
     """Load symbols and industries from pre-generated CSV - INSTANT LOAD!"""
+    global _symbol_industry_cache
+    if _symbol_industry_cache:
+        return _symbol_industry_cache
     try:
         # Load from the pre-generated CSV with industries
         df = pd.read_csv("nifty100_with_industries.csv")
@@ -70,39 +126,40 @@ def load_symbols_with_industries():
         # Remove N/A entries if you want
         # symbol_industry_map = {k: v for k, v in symbol_industry_map.items() if v != "N/A"}
         
-        print(f"✓ Industry mapping ready with {len(symbol_industry_map)} stocks!")
+        logger.info(f"✓ Industry mapping ready with {len(symbol_industry_map)} stocks!")
         
+        _symbol_industry_cache = symbol_industry_map
         return symbol_industry_map
         
     except FileNotFoundError:
-        print("ERROR: nifty100_with_industries.csv not found!")
-        print("Please run fetch_static_data.py first to generate the file.")
+        logger.error("ERROR: nifty100_with_industries.csv not found!")
+        logger.error("Please run fetch_static_data.py first to generate the file.")
         return {}
     except Exception as e:
-        print(f"Error loading CSV: {e}")
+        logger.error(f"Error loading CSV: {e}")
         return {}
 
 
-SYMBOL_INDUSTRY_MAP = {}
+# Note: Removed global SYMBOL_INDUSTRY_MAP - using dcc.Store exclusively for thread safety
 
 
 # -------------------------------------------------------------------
 # 2) CONSOLIDATED NSE DATA FETCH
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
+@cached(cache=nse_data_cache)
 def get_nse_data(symbol: str):
-    """Fetch full NSE data once and cache."""
+    """Fetch full NSE data once and cache with TTL."""
     try:
         return nse_eq(symbol)
     except Exception as e:
-        print(f"NSE Data Fetch Error for {symbol}: {e}")
+        logger.warning(f"NSE Data Fetch Error for {symbol}: {e}")
         return None
 
 
 # -------------------------------------------------------------------
 # 3) FUNDAMENTALS for single stock
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
+@cached(cache=fundamentals_cache)
 def get_fundamentals(symbol: str):
     try:
         data = get_nse_data(symbol)
@@ -155,24 +212,30 @@ def get_fundamentals(symbol: str):
 # -------------------------------------------------------------------
 # 4) HISTORICAL PRICE COMPARISON
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
 def get_historical_comparison(symbol: str, days: int):
-    """Get price comparison for N days ago."""
+    """Get price comparison for N trading days ago (correctly indexed)."""
+    # Create cache key
+    cache_key = f"{symbol}_{days}"
+    if cache_key in historical_cache:
+        return historical_cache[cache_key]
+    
     try:
         tk = yf.Ticker(symbol + ".NS")
         
         # Fetch historical data - get extra days to account for weekends/holidays
-        hist = tk.history(period=f"{days + 10}d", interval="1d")
+        hist = tk.history(period=f"{days + TRADING_DAYS_BUFFER}d", interval="1d")
         
         if hist.empty or len(hist) < 2:
             return None, None, None
         
-        # Get current price (most recent)
+        # Get current price (most recent) - index -1 is today
         current_price = float(hist['Close'].iloc[-1])
         
-        # Get price from N days ago (or closest available)
-        if len(hist) >= days:
-            old_price = float(hist['Close'].iloc[-days])
+        # Get price from N days ago
+        # -1 is today, -2 is yesterday, so -(days+1) is N days ago
+        target_index = -(days + 1)
+        if len(hist) >= abs(target_index):
+            old_price = float(hist['Close'].iloc[target_index])
         else:
             # Use oldest available if not enough data
             old_price = float(hist['Close'].iloc[0])
@@ -181,25 +244,31 @@ def get_historical_comparison(symbol: str, days: int):
         price_change = current_price - old_price
         price_change_pct = (price_change / old_price * 100) if old_price != 0 else None
         
-        return old_price, price_change, price_change_pct
+        result = (old_price, price_change, price_change_pct)
+        historical_cache[cache_key] = result
+        return result
         
     except Exception as e:
-        print(f"Historical data error for {symbol}: {e}")
+        logger.warning(f"Historical data error for {symbol}: {e}")
         return None, None, None
 
 
 # -------------------------------------------------------------------
 # 5) VOLUME STATS
 # -------------------------------------------------------------------
-@lru_cache(maxsize=256)
 def get_volume_stats(symbol: str):
-    """Return volume metrics with retry backoff for rate limits."""
+    """Return volume metrics with retry backoff for rate limits and TTL caching."""
+    # Check cache first
+    if symbol in volume_cache:
+        return volume_cache[symbol]
     
     def _fetch_volume(sym):
         tk = yf.Ticker(sym + ".NS")
         
         avg_vol = None
-        weekly_turnover = []  # Store last 7 days of turnover data
+        avg_turnover = None      # Average daily turnover (for consistent comparison)
+        todays_turnover = None   # Today's turnover from Yahoo Finance
+        weekly_turnover = []     # Store last 7 days of turnover data
         hist_30 = None
         
         try:
@@ -207,15 +276,26 @@ def get_volume_stats(symbol: str):
             if "Volume" in hist_30.columns and not hist_30["Volume"].empty:
                 avg_vol = float(hist_30["Volume"].mean())
                 
+                # Calculate average turnover (Close × Volume) for consistency
+                if "Close" in hist_30.columns:
+                    turnovers = hist_30["Close"] * hist_30["Volume"]
+                    avg_turnover = float(turnovers.mean())
+                
                 # Extract last 7 days of turnover (Close × Volume)
-                if "Close" in hist_30.columns and len(hist_30) >= 7:
-                    last_7_days = hist_30.tail(7)
-                    for idx, row in last_7_days.iterrows():
-                        date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, 'strftime') else str(idx)[:10]
-                        turnover = float(row["Close"]) * float(row["Volume"])
-                        weekly_turnover.append({"date": date_str, "turnover": turnover})
+                if "Close" in hist_30.columns and len(hist_30) >= 1:
+                    # Get today's turnover from the most recent data point
+                    latest_row = hist_30.iloc[-1]
+                    todays_turnover = float(latest_row["Close"]) * float(latest_row["Volume"])
+                    
+                    # Get last 7 days for the weekly chart
+                    if len(hist_30) >= 7:
+                        last_7_days = hist_30.tail(7)
+                        for idx, row in last_7_days.iterrows():
+                            date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, 'strftime') else str(idx)[:10]
+                            turnover = float(row["Close"]) * float(row["Volume"])
+                            weekly_turnover.append({"date": date_str, "turnover": turnover})
         except Exception as e:
-            print(f"  Avg volume fetch error for {sym}: {e}")
+            logger.warning(f"  Avg volume fetch error for {sym}: {e}")
 
         todays_vol = None
         try:
@@ -241,15 +321,23 @@ def get_volume_stats(symbol: str):
             "avg_volume": avg_vol,
             "todays_volume": todays_vol,
             "volume_change_pct": vol_change_pct,
-            "weekly_turnover": weekly_turnover,  # New field with 7-day turnover
+            "weekly_turnover": weekly_turnover,
+            # NEW: Consistent turnover data from Yahoo Finance
+            "todays_turnover": todays_turnover,    # For TURNOVER TODAY display
+            "avg_turnover": avg_turnover,           # For comparison (30-day avg)
         }
     
-    return retry_with_backoff(_fetch_volume, symbol, max_retries=3, base_delay=0.5) or {
+    result = retry_with_backoff(_fetch_volume, symbol, max_retries=3, base_delay=0.5) or {
         "avg_volume": None,
         "todays_volume": None,
         "volume_change_pct": None,
         "weekly_turnover": [],
+        "todays_turnover": None,
+        "avg_turnover": None,
     }
+    # Store in cache for TTL expiration
+    volume_cache[symbol] = result
+    return result
 
 
 # -------------------------------------------------------------------
@@ -257,12 +345,35 @@ def get_volume_stats(symbol: str):
 # -------------------------------------------------------------------
 from datetime import time as dt_time
 
+def get_expected_volume_factor(current_time):
+    """
+    Get the expected cumulative volume factor based on time of day.
+    Uses U-shaped distribution (high at open/close, low at midday).
+    Returns a value between 0.0 and 1.0 representing expected % of daily volume.
+    """
+    if current_time is None:
+        return 1.0
+    
+    current_hour = current_time.hour
+    current_minute = current_time.minute
+    
+    # Find the nearest time slot in our distribution
+    best_factor = 1.0
+    for (hour, minute), factor in INTRADAY_VOL_DISTRIBUTION.items():
+        if (hour, minute) <= (current_hour, current_minute):
+            best_factor = factor
+    
+    return best_factor if best_factor > 0 else 0.01  # Avoid division by zero
+
 def calculate_aggregate_volume_indicator(stocks_data):
     """
     Calculate aggregate volume % change indicator for all stocks.
     
-    Uses price-weighted volume (turnover) for proper normalization.
-    This accounts for different stock prices when aggregating volume.
+    FIXED APPROACH:
+    - Uses pure volume ratio for main comparison (avoids price timing issues)
+    - Turnover is calculated separately for display purposes only
+    - Uses significance thresholds for volume breadth (20% above/below)
+    - Uses non-linear intraday volume distribution for projections
     
     Returns:
         dict with volume metrics, alert level, and market breadth
@@ -271,16 +382,19 @@ def calculate_aggregate_volume_indicator(stocks_data):
         return None
     
     # Initialize accumulators
-    total_turnover_today = 0          # Price × Today's Volume
-    total_turnover_avg = 0            # Price × Average Volume
+    total_volume_today = 0            # Raw volume today (for ratio)
+    total_volume_avg = 0              # Raw average volume (for ratio)
+    total_turnover_today = 0          # Price × Today's Volume (for display)
+    total_turnover_avg = 0            # Price × Average Volume (for display)
     
     # Directional flow tracking
     up_turnover = 0                   # Turnover from stocks going up
     down_turnover = 0                 # Turnover from stocks going down
     
-    # Market breadth counters
-    stocks_above_avg_vol = 0          # Stocks with above average volume
-    stocks_below_avg_vol = 0          # Stocks with below average volume
+    # Market breadth counters with significance thresholds
+    stocks_elevated_vol = 0           # Stocks with volume > 1.2× average
+    stocks_normal_vol = 0             # Stocks with volume 0.8× to 1.2× average
+    stocks_reduced_vol = 0            # Stocks with volume < 0.8× average
     stocks_up = 0
     stocks_down = 0
     stocks_neutral = 0
@@ -301,6 +415,10 @@ def calculate_aggregate_volume_indicator(stocks_data):
         market_cap = safe_float(stock.get("MARKET_CAP_CR"))
         vol_change_pct = safe_float(stock.get("VOL_CHANGE_PCT"))
         
+        # NEW: Get consistent turnover from Yahoo Finance (same source as weekly chart)
+        todays_turnover_yf = safe_float(stock.get("TODAYS_TURNOVER"))
+        avg_turnover_yf = safe_float(stock.get("AVG_TURNOVER"))
+        
         # Skip if essential data is missing
         if current_price is None or today_volume is None or avg_volume is None:
             continue
@@ -309,22 +427,36 @@ def calculate_aggregate_volume_indicator(stocks_data):
         
         valid_stocks += 1
         
-        # Calculate turnover (Price × Volume)
-        turnover_today = current_price * today_volume
-        turnover_avg = current_price * avg_volume
+        # Accumulate raw volumes for ratio calculation (FIXED: pure volume comparison)
+        total_volume_today += today_volume
+        total_volume_avg += avg_volume
         
-        total_turnover_today += turnover_today
-        total_turnover_avg += turnover_avg
+        # FIXED: Use Yahoo Finance turnover for consistency with weekly chart
+        # This ensures TURNOVER TODAY matches the weekly chart values exactly
+        if todays_turnover_yf is not None:
+            total_turnover_today += todays_turnover_yf
+        else:
+            # Fallback to calculated if Yahoo data missing
+            total_turnover_today += current_price * today_volume
+            
+        if avg_turnover_yf is not None:
+            total_turnover_avg += avg_turnover_yf
+        else:
+            # Fallback to calculated if Yahoo data missing
+            total_turnover_avg += current_price * avg_volume
         
         # Track individual volume changes for stats
         if vol_change_pct is not None:
             individual_vol_changes.append(vol_change_pct)
         
-        # Market breadth: above/below average volume
-        if today_volume > avg_volume:
-            stocks_above_avg_vol += 1
+        # Market breadth with significance thresholds (FIXED: 20% thresholds)
+        volume_ratio_stock = today_volume / avg_volume
+        if volume_ratio_stock >= VOL_ELEVATED_THRESHOLD:
+            stocks_elevated_vol += 1
+        elif volume_ratio_stock <= VOL_REDUCED_THRESHOLD:
+            stocks_reduced_vol += 1
         else:
-            stocks_below_avg_vol += 1
+            stocks_normal_vol += 1
         
         # Market cap weighted volume change
         if market_cap is not None and vol_change_pct is not None:
@@ -332,12 +464,15 @@ def calculate_aggregate_volume_indicator(stocks_data):
             weighted_vol_change += market_cap * vol_change_pct
         
         # Directional flow (up vs down stocks)
+        # Use Yahoo Finance turnover for consistency
+        stock_turnover = todays_turnover_yf if todays_turnover_yf is not None else (current_price * today_volume)
+        
         if price_change_pct is not None:
             if price_change_pct > 0:
-                up_turnover += turnover_today
+                up_turnover += stock_turnover
                 stocks_up += 1
             elif price_change_pct < 0:
-                down_turnover += turnover_today
+                down_turnover += stock_turnover
                 stocks_down += 1
             else:
                 stocks_neutral += 1
@@ -345,13 +480,13 @@ def calculate_aggregate_volume_indicator(stocks_data):
             stocks_neutral += 1
     
     # Avoid division by zero
-    if total_turnover_avg == 0 or valid_stocks == 0:
+    if total_volume_avg == 0 or valid_stocks == 0:
         return None
     
     # ========== CORE CALCULATIONS ==========
     
-    # 1. Volume Ratio (Today vs Average)
-    volume_ratio = total_turnover_today / total_turnover_avg
+    # 1. Volume Ratio using RAW VOLUME (FIXED: no price mixing)
+    volume_ratio = total_volume_today / total_volume_avg
     volume_pct_change = (volume_ratio - 1) * 100
     
     # 2. Market Cap Weighted Volume Change
@@ -364,28 +499,30 @@ def calculate_aggregate_volume_indicator(stocks_data):
     total_flow = up_turnover + down_turnover
     flow_ratio = (up_turnover / total_flow * 100) if total_flow > 0 else 50
     
-    # 4. Intraday Volume Scaling (if market is open)
-    # Indian market hours: 9:15 AM to 3:30 PM IST
-    current_time = datetime.now()
-    market_open = current_time.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = current_time.replace(hour=15, minute=30, second=0, microsecond=0)
+    # 4. Intraday Volume Scaling with NON-LINEAR distribution (FIXED)
+    # Use IST timezone for Indian market
+    current_time = datetime.now(IST)
+    market_open = current_time.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MINUTE, second=0, microsecond=0)
+    market_close = current_time.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
     
     intraday_factor = 1.0
+    expected_vol_factor = 1.0
     scaled_volume_pct_change = volume_pct_change
     
     if market_open <= current_time <= market_close:
-        # Calculate how much of the trading day has passed
-        total_trading_seconds = (market_close - market_open).total_seconds()
-        elapsed_seconds = (current_time - market_open).total_seconds()
-        day_progress = elapsed_seconds / total_trading_seconds
+        # Get expected volume % based on U-shaped distribution
+        expected_vol_factor = get_expected_volume_factor(current_time)
+        intraday_factor = expected_vol_factor
         
-        if day_progress > 0:
-            # Scale expected volume based on time elapsed
-            intraday_factor = day_progress
-            # Projected full-day turnover
-            projected_turnover = total_turnover_today / day_progress
-            scaled_volume_ratio = projected_turnover / total_turnover_avg
+        if expected_vol_factor > 0:
+            # Project full-day volume using non-linear curve
+            projected_volume = total_volume_today / expected_vol_factor
+            scaled_volume_ratio = projected_volume / total_volume_avg
             scaled_volume_pct_change = (scaled_volume_ratio - 1) * 100
+    
+    # Calculate "above average" count for backward compatibility
+    stocks_above_avg_vol = stocks_elevated_vol + (stocks_normal_vol // 2)  # Include half of normal as "above"
+    stocks_below_avg_vol = stocks_reduced_vol + (stocks_normal_vol - stocks_normal_vol // 2)
     
     # ========== ALERT LEVEL DETERMINATION ==========
     # Use volume ratio for clearer thresholds
@@ -647,6 +784,9 @@ def fetch_stocks_data_for_industry(symbols, days_comparison=10, batch_size: int 
                 "TODAY_VOLUME": vol.get('todays_volume'),
                 "VOL_CHANGE_PCT": vol.get('volume_change_pct'),
                 "WEEKLY_TURNOVER": vol.get('weekly_turnover', []),
+                # NEW: Consistent turnover from Yahoo Finance (matches weekly chart)
+                "TODAYS_TURNOVER": vol.get('todays_turnover'),
+                "AVG_TURNOVER": vol.get('avg_turnover'),
                 "MARKET_CAP_CR": fund.get('Market Cap'),
                 "PE": fund.get('P/E'),
                 "EPS": fund.get('EPS'),
@@ -1013,26 +1153,26 @@ app.layout = dbc.Container([
     Input("industry-filter", "id")
 )
 def initialize_data(_):
-    """Load symbol-industry mapping from CSV - INSTANT LOAD!"""
-    global SYMBOL_INDUSTRY_MAP
+    """Load symbol-industry mapping from CSV - INSTANT LOAD!
+    Note: Uses dcc.Store for state management instead of global variable for thread safety.
+    """
+    logger.info("Loading pre-generated industry data...")
+    symbol_industry_map = load_symbols_with_industries()
     
-    print("Loading pre-generated industry data...")
-    SYMBOL_INDUSTRY_MAP = load_symbols_with_industries()
-    
-    if not SYMBOL_INDUSTRY_MAP:
-        print("WARNING: No data loaded! Please run fetch_static_data.py first!")
+    if not symbol_industry_map:
+        logger.warning("WARNING: No data loaded! Please run fetch_static_data.py first!")
         return {}, []
     
-    industries = set(SYMBOL_INDUSTRY_MAP.values())
+    industries = set(symbol_industry_map.values())
     industries.discard("N/A")
     
     # Add "All" option at the beginning
     options = [{"label": "🌐 All Industries", "value": "ALL"}]
     options.extend([{"label": ind, "value": ind} for ind in sorted(industries)])
     
-    print(f"✓ Dropdown ready with {len(options)} options (including 'All')")
+    logger.info(f"✓ Dropdown ready with {len(options)} options (including 'All')")
     
-    return SYMBOL_INDUSTRY_MAP, options
+    return symbol_industry_map, options
 
 
 # Callback 2: Enable/Disable refresh button and auto-refresh
@@ -1085,11 +1225,11 @@ def fetch_industry_data(selected_industry, manual_clicks, auto_intervals, days_i
     
     # Clear caches on manual refresh or auto refresh
     if manual_clicks or auto_intervals > 0 or trigger_source == "Days Changed":
-        get_nse_data.cache_clear()
-        get_fundamentals.cache_clear()
-        get_volume_stats.cache_clear()
-        get_historical_comparison.cache_clear()
-        print(f"[{trigger_source.upper()}] Caches cleared at {datetime.now().strftime('%H:%M:%S')}")
+        nse_data_cache.clear()
+        fundamentals_cache.clear()
+        volume_cache.clear()
+        historical_cache.clear()
+        logger.info(f"[{trigger_source.upper()}] Caches cleared at {datetime.now(IST).strftime('%H:%M:%S')}")
     
     # Get symbols for selected industry or all symbols
     if selected_industry == "ALL":
@@ -1131,7 +1271,8 @@ def handle_sort(n_clicks_list, current_column, current_direction):
 
     # Extract which button triggered
     triggered = ctx.triggered[0]["prop_id"].split(".")[0]
-    triggered_id = eval(triggered)   # Convert string dict to actual dict
+    # SECURITY FIX: Use json.loads instead of eval
+    triggered_id = json.loads(triggered)
 
     column = triggered_id["column"]
 
