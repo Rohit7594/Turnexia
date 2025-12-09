@@ -200,7 +200,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📧 Contact
 
-**Author**: Rohit Kumar Singh  
 **GitHub**: [@Rohit7594](https://github.com/Rohit7594)
 
 ---
