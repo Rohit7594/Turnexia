@@ -8,6 +8,7 @@ from datetime import datetime
 from nsepython import nse_eq
 import time
 from dash.dependencies import ALL
+import plotly.graph_objects as go
 
 # -------------------------------------------------------------------
 # SAFETY WRAPPER
@@ -198,10 +199,21 @@ def get_volume_stats(symbol: str):
         tk = yf.Ticker(sym + ".NS")
         
         avg_vol = None
+        weekly_turnover = []  # Store last 7 days of turnover data
+        hist_30 = None
+        
         try:
             hist_30 = tk.history(period="30d", interval="1d")
             if "Volume" in hist_30.columns and not hist_30["Volume"].empty:
                 avg_vol = float(hist_30["Volume"].mean())
+                
+                # Extract last 7 days of turnover (Close × Volume)
+                if "Close" in hist_30.columns and len(hist_30) >= 7:
+                    last_7_days = hist_30.tail(7)
+                    for idx, row in last_7_days.iterrows():
+                        date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, 'strftime') else str(idx)[:10]
+                        turnover = float(row["Close"]) * float(row["Volume"])
+                        weekly_turnover.append({"date": date_str, "turnover": turnover})
         except Exception as e:
             print(f"  Avg volume fetch error for {sym}: {e}")
 
@@ -229,12 +241,14 @@ def get_volume_stats(symbol: str):
             "avg_volume": avg_vol,
             "todays_volume": todays_vol,
             "volume_change_pct": vol_change_pct,
+            "weekly_turnover": weekly_turnover,  # New field with 7-day turnover
         }
     
     return retry_with_backoff(_fetch_volume, symbol, max_retries=3, base_delay=0.5) or {
         "avg_volume": None,
         "todays_volume": None,
         "volume_change_pct": None,
+        "weekly_turnover": [],
     }
 
 
@@ -471,10 +485,117 @@ def format_turnover_crores(value):
         return f"₹{crores:,.0f} Cr"
     except:
         return "-"
+# -------------------------------------------------------------------
+# 7) WEEKLY TURNOVER BAR CHART
+# -------------------------------------------------------------------
+def create_weekly_turnover_chart(stocks_data):
+    """
+    Create a bar chart showing aggregate turnover for the last 7 days.
+    Uses existing data from stocks_data - no additional API calls.
+    """
+    if not stocks_data:
+        return None
+    
+    # Aggregate turnover by date across all stocks
+    daily_turnover = {}
+    stocks_with_data = 0
+    
+    for stock in stocks_data:
+        weekly_data = stock.get("WEEKLY_TURNOVER", [])
+        if weekly_data:
+            stocks_with_data += 1
+        for day_data in weekly_data:
+            date = day_data.get("date")
+            turnover = day_data.get("turnover", 0)
+            if date:
+                daily_turnover[date] = daily_turnover.get(date, 0) + turnover
+    
+    print(f"DEBUG: {stocks_with_data}/{len(stocks_data)} stocks have WEEKLY_TURNOVER data. Daily turnover entries: {len(daily_turnover)}")
+    
+    if not daily_turnover:
+        return None
+    
+    try:
+        # Sort by date
+        sorted_dates = sorted(daily_turnover.keys())
+        dates = sorted_dates[-7:]  # Last 7 days
+        turnovers = [daily_turnover[d] / 1e7 for d in dates]  # Convert to Crores
+        
+        print(f"DEBUG: Creating chart with dates={dates}, turnovers={turnovers}")
+        
+        # Format dates for display (e.g., "Mon 09")
+        display_dates = []
+        for d in dates:
+            try:
+                dt = datetime.strptime(d, "%Y-%m-%d")
+                display_dates.append(dt.strftime("%a %d"))
+            except:
+                display_dates.append(d[-5:])
+        
+        # Create bar chart
+        fig = go.Figure()
+        
+        text_colors = ['#FFF' if t < (max(turnovers) * 0.35) else '#111' for t in turnovers]
+
+        fig.add_trace(go.Bar(
+            x=display_dates,
+            y=turnovers,
+            marker=dict(
+                color=turnovers,
+                colorscale=[[0, '#0099CC'], [0.5, '#00D4FF'], [1, '#00FF88']],
+                line=dict(color='rgba(0, 212, 255, 0.8)', width=1)
+            ),
+            text=[f"₹{t:,.0f} Cr" for t in turnovers],
+            textposition='auto',
+            textfont=dict(color=text_colors, size=15),   # << updated
+            hovertemplate="<b>%{x}</b><br>Turnover: ₹%{y:,.0f} Cr<extra></extra>"
+        ))
+        
+        fig.update_layout(
+            title=None,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(family="Inter, sans-serif", color="#888"),
+            height=220,
+            margin=dict(l=50, r=20, t=50, b=40),
+            xaxis=dict(
+                showgrid=False,
+                showline=True,
+                linecolor='#333',
+                tickfont=dict(size=11, color='#888')
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridcolor='rgba(50,50,50,0.5)',
+                showline=False,
+                tickformat=',d',
+                ticksuffix=' Cr',
+                tickfont=dict(size=10, color='#666')
+            ),
+            hoverlabel=dict(
+                bgcolor='#1a1a2e',
+                font_size=12,
+                font_family="Inter"
+            )
+        )
+        
+        chart = dcc.Graph(
+            figure=fig,
+            config={'displayModeBar': False},
+            style={'width': '100%'}
+        )
+        print("DEBUG: Chart created successfully!")
+        return chart
+        
+    except Exception as e:
+        print(f"ERROR creating chart: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 # -------------------------------------------------------------------
-# 7) FETCH DATA FOR SYMBOLS IN SELECTED INDUSTRY
+# 8) FETCH DATA FOR SYMBOLS IN SELECTED INDUSTRY
 # -------------------------------------------------------------------
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -525,6 +646,7 @@ def fetch_stocks_data_for_industry(symbols, days_comparison=10, batch_size: int 
                 "TODAY_VOLUME_AVERAGE": vol.get('avg_volume'),
                 "TODAY_VOLUME": vol.get('todays_volume'),
                 "VOL_CHANGE_PCT": vol.get('volume_change_pct'),
+                "WEEKLY_TURNOVER": vol.get('weekly_turnover', []),
                 "MARKET_CAP_CR": fund.get('Market Cap'),
                 "PE": fund.get('P/E'),
                 "EPS": fund.get('EPS'),
@@ -1148,6 +1270,14 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
         ])
 
     stocks_data = stocks_data_store.get(selected_industry, [])
+    
+    # Debug: Check if WEEKLY_TURNOVER exists in the first stock
+    if stocks_data:
+        first_stock = stocks_data[0]
+        wt = first_stock.get("WEEKLY_TURNOVER", "MISSING")
+        print(f"DEBUG generate_table: {len(stocks_data)} stocks, first stock WEEKLY_TURNOVER = {type(wt).__name__}, len={len(wt) if isinstance(wt, list) else 'N/A'}")
+    else:
+        print("DEBUG generate_table: stocks_data is empty")
 
     if not stocks_data:
         return html.Div([
@@ -1334,6 +1464,10 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
     
     # ========== AGGREGATE VOLUME INDICATOR CARD ==========
     vol_indicator = calculate_aggregate_volume_indicator(stocks_data)
+    
+    # Create weekly turnover chart before building the card
+    weekly_turnover_chart = create_weekly_turnover_chart(stocks_data)
+    print(f"DEBUG weekly_turnover_chart is: {type(weekly_turnover_chart).__name__}, truthy={bool(weekly_turnover_chart)}")
     
     if vol_indicator:
         # Format the percentage change with proper sign
@@ -1564,7 +1698,17 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
                         html.Span("Projected: ", style={"color": "#666", "fontWeight": "600"}),
                         html.Span(scaled_display, style={"color": "#00D4FF", "fontWeight": "700", "fontSize": "1.1rem"})
                     ], style={"fontSize": "0.85rem", "display": "flex", "alignItems": "center", "justifyContent": "center"})
-                ]) if vol_indicator["intraday_factor"] < 1.0 else None
+                ]) if vol_indicator["intraday_factor"] < 1.0 else None,
+                
+                # Weekly Turnover Bar Chart
+                html.Div([
+                    html.Hr(style={"borderColor": "#333", "margin": "18px 0 12px 0"}),
+                    html.Div([
+                        html.Span("📊", style={"fontSize": "1rem", "marginRight": "8px"}),
+                        html.Span("WEEKLY TURNOVER TREND", style={"color": "#888", "fontSize": "0.7rem", "letterSpacing": "1px", "fontWeight": "600"})
+                    ], style={"marginBottom": "10px"}),
+                    weekly_turnover_chart if weekly_turnover_chart is not None else html.Div("No weekly data available", style={"color": "#555", "fontSize": "0.8rem"})
+                ])
                 
             ], style={"padding": "25px"})
         ], style={
