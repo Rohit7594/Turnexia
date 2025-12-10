@@ -4,7 +4,7 @@ import dash_bootstrap_components as dbc
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
-from nsepython import nse_eq
+from nsepython import nse_eq, nsefetch
 import time
 from dash.dependencies import ALL
 import plotly.graph_objects as go
@@ -13,6 +13,7 @@ import logging
 import os
 from cachetools import TTLCache, cached
 import pytz
+from urllib.parse import quote
 
 # ===================================================================
 # CONFIGURATION CONSTANTS
@@ -38,6 +39,13 @@ MARKET_CLOSE_MINUTE = 30
 # Timezone
 IST = pytz.timezone('Asia/Kolkata')
 
+# Supported Indices
+SUPPORTED_INDICES = {
+    "NIFTY50": {"name": "Nifty 50", "emoji": "📊", "count": 50},
+    "NIFTY100": {"name": "Nifty 100", "emoji": "📈", "count": 100},
+}
+DEFAULT_INDEX = "NIFTY100"
+
 # Intraday volume distribution (cumulative expected % by time)
 # Based on typical Indian market volume patterns
 INTRADAY_VOL_DISTRIBUTION = {
@@ -48,6 +56,13 @@ INTRADAY_VOL_DISTRIBUTION = {
     (13, 15): 0.59, (13, 30): 0.62, (13, 45): 0.65, (14, 0): 0.69,
     (14, 15): 0.73, (14, 30): 0.78, (14, 45): 0.84, (15, 0): 0.91,
     (15, 15): 0.96, (15, 30): 1.00,
+}
+
+# NSE Index API URLs - Official NSE endpoints for index constituents
+NSE_INDEX_API_URL = "https://www.nseindia.com/api/equity-stockIndices?index={}"
+NSE_INDEX_NAMES = {
+    "NIFTY50": "NIFTY 50",
+    "NIFTY100": "NIFTY 100",
 }
 
 # Setup logging
@@ -61,6 +76,10 @@ nse_data_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
 fundamentals_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
 historical_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
 volume_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
+
+# Index constituents cache (long TTL - 1 hour since index composition rarely changes)
+INDEX_CACHE_TTL = 3600  # 1 hour
+index_constituents_cache = TTLCache(maxsize=10, ttl=INDEX_CACHE_TTL)
 
 # -------------------------------------------------------------------
 # SAFETY WRAPPER
@@ -105,43 +124,164 @@ def retry_with_backoff(func, symbol: str, max_retries: int = 3, base_delay: floa
 
 
 # -------------------------------------------------------------------
-# 1) Load pre-generated symbol-industry mapping (FAST!)
+# 1) DYNAMIC INDEX LOADING - USING NSE OFFICIAL API
 # -------------------------------------------------------------------
-# Using simple caching for static data (no TTL needed - file doesn't change)
-_symbol_industry_cache = {}
-
-def load_symbols_with_industries():
-    """Load symbols and industries from pre-generated CSV - INSTANT LOAD!"""
-    global _symbol_industry_cache
-    if _symbol_industry_cache:
-        return _symbol_industry_cache
+def get_index_constituents_from_nse(index_name: str) -> list:
+    """
+    Fetch index constituents directly from NSE Official API.
+    Returns up-to-date symbols without any manual remapping needed.
+    
+    This is the authoritative source - NSE always has current symbols
+    reflecting all corporate actions (mergers, delistings, renames).
+    """
     try:
-        # Load from the pre-generated CSV with industries
-        df = pd.read_csv("nifty100_with_industries.csv")
+        # Get the NSE index name (with proper formatting)
+        nse_index_name = NSE_INDEX_NAMES.get(index_name, "NIFTY 100")
         
-        print(f"✓ Loaded {len(df)} symbols with industries from CSV")
+        # URL encode the index name for the API
+        encoded_index = quote(nse_index_name)
+        url = NSE_INDEX_API_URL.format(encoded_index)
         
-        # Create symbol -> industry mapping
-        symbol_industry_map = dict(zip(df["symbol"], df["industry"]))
+        logger.info(f"📡 Fetching {index_name} constituents from NSE API...")
+        response = nsefetch(url)
         
-        # Remove N/A entries if you want
-        # symbol_industry_map = {k: v for k, v in symbol_industry_map.items() if v != "N/A"}
-        
-        logger.info(f"✓ Industry mapping ready with {len(symbol_industry_map)} stocks!")
-        
-        _symbol_industry_cache = symbol_industry_map
-        return symbol_industry_map
-        
-    except FileNotFoundError:
-        logger.error("ERROR: nifty100_with_industries.csv not found!")
-        logger.error("Please run fetch_static_data.py first to generate the file.")
-        return {}
+        if response and isinstance(response, dict) and 'data' in response:
+            symbols = []
+            for item in response['data']:
+                symbol = item.get('symbol')
+                # Skip the index row itself (e.g., "NIFTY 50" or "NIFTY 100")
+                if symbol and symbol not in ['NIFTY 50', 'NIFTY 100', 'NIFTY50', 'NIFTY100']:
+                    symbols.append(symbol)
+            
+            if symbols:
+                logger.info(f"✓ Loaded {len(symbols)} symbols from NSE Official API for {index_name}")
+                return symbols
+            else:
+                logger.warning(f"NSE API returned empty symbols list for {index_name}")
+        else:
+            logger.warning(f"Invalid response from NSE API: {type(response)}")
+            
     except Exception as e:
-        logger.error(f"Error loading CSV: {e}")
+        logger.warning(f"NSE Official API failed for {index_name}: {e}")
+    
+    return []
+
+
+def get_index_constituents(index_name: str) -> list:
+    """
+    Get list of symbols for an index.
+    
+    Data source priority:
+    1. NSE Official API (always up-to-date, authoritative)
+    2. Local CSV file (fallback for offline/error scenarios)
+    
+    Uses caching - only fetches once per hour.
+    """
+    cache_key = f"symbols_{index_name}"
+    
+    # Check cache first
+    if cache_key in index_constituents_cache:
+        logger.info(f"✓ Using cached {index_name} constituents")
+        return index_constituents_cache[cache_key]
+    
+    symbols = []
+    
+    # PRIMARY: Try NSE Official API first (authoritative, always current)
+    symbols = get_index_constituents_from_nse(index_name)
+    
+    if symbols:
+        # Successfully got symbols from NSE API
+        index_constituents_cache[cache_key] = symbols
+        return symbols
+    
+    # FALLBACK: Use local CSV file
+    logger.info(f"⚠️ Falling back to CSV for {index_name}")
+    try:
+        csv_file = "nifty100_with_industries.csv" if index_name == "NIFTY100" else "nifty50_with_industries.csv"
+        if not os.path.exists(csv_file):
+            csv_file = "nifty100_with_industries.csv"  # Use nifty100 as default fallback
+        
+        df = pd.read_csv(csv_file)
+        symbols = df["symbol"].tolist()
+        
+        # For Nifty 50, take first 50 if using nifty100 file
+        if index_name == "NIFTY50" and len(symbols) > 50:
+            symbols = symbols[:50]
+        
+        logger.info(f"✓ Loaded {len(symbols)} symbols from CSV fallback for {index_name}")
+        index_constituents_cache[cache_key] = symbols
+        return symbols
+        
+    except Exception as e:
+        logger.error(f"Failed to load index constituents: {e}")
+        return []
+
+
+def get_symbol_industry(symbol: str) -> str:
+    """Get industry for a single symbol from NSE API. Uses cache."""
+    try:
+        data = get_nse_data(symbol)
+        if data:
+            industry_info = data.get("industryInfo", {})
+            return industry_info.get("industry") or industry_info.get("sector") or "N/A"
+    except Exception as e:
+        logger.warning(f"Could not get industry for {symbol}: {e}")
+    return "N/A"
+
+
+def load_index_with_industries(index_name: str) -> dict:
+    """
+    Load symbols with industries for a given index.
+    Uses caching for both symbols and industries.
+    Returns: {symbol: industry} mapping
+    """
+    cache_key = f"index_industries_{index_name}"
+    
+    # Check cache first
+    if cache_key in index_constituents_cache:
+        logger.info(f"✓ Using cached {index_name} industries mapping")
+        return index_constituents_cache[cache_key]
+    
+    # Get symbols for the index
+    symbols = get_index_constituents(index_name)
+    if not symbols:
         return {}
+    
+    symbol_industry_map = {}
+    
+    # Try to load industries from CSV first (faster)
+    try:
+        csv_file = "nifty100_with_industries.csv"
+        if os.path.exists(csv_file):
+            df = pd.read_csv(csv_file)
+            csv_map = dict(zip(df["symbol"], df["industry"]))
+            
+            for symbol in symbols:
+                if symbol in csv_map:
+                    symbol_industry_map[symbol] = csv_map[symbol]
+                else:
+                    # Fetch from API for symbols not in CSV
+                    symbol_industry_map[symbol] = get_symbol_industry(symbol)
+            
+            logger.info(f"✓ Loaded industries for {len(symbol_industry_map)} stocks")
+    except Exception as e:
+        logger.warning(f"CSV industry load failed: {e}. Fetching from API...")
+        # Fallback: fetch all from API (slower)
+        for symbol in symbols:
+            symbol_industry_map[symbol] = get_symbol_industry(symbol)
+    
+    # Cache the result
+    index_constituents_cache[cache_key] = symbol_industry_map
+    return symbol_industry_map
 
 
-# Note: Removed global SYMBOL_INDUSTRY_MAP - using dcc.Store exclusively for thread safety
+# Legacy function for backward compatibility
+def load_symbols_with_industries():
+    """Load symbols and industries - defaults to NIFTY100."""
+    return load_index_with_industries(DEFAULT_INDEX)
+
+
+# Note: Using dcc.Store for state management (thread-safe)
 
 
 # -------------------------------------------------------------------
@@ -1050,13 +1190,33 @@ app.layout = dbc.Container([
                 "WebkitTextFillColor": "transparent",
                 "fontWeight": "800",
             }),
-            html.Span(" - NIFTY100", style={"color": "#888", "fontWeight": "400", "fontSize": "0.7em"})
+            html.Span(id="header-index-name", children=" - NIFTY100", 
+                     style={"color": "#888", "fontWeight": "400", "fontSize": "0.7em"})
         ], style={"margin": "0", "fontSize": "2.2rem", "letterSpacing": "-1px"}),
         html.P("Real-time stock screener with aggregate volume analytics", 
                style={"color": "#666", "fontSize": "0.9rem", "margin": "5px 0 0 0", "letterSpacing": "0.5px"})
     ], className="text-center", style={"padding": "20px 0 25px 0"}),
     
     dbc.Row([
+        # NEW: Index Selector Dropdown
+        dbc.Col([
+            html.Label("Select Index:", style={"color": "#00D4FF", "fontWeight": "600", "marginBottom": "5px"}),
+            dcc.Dropdown(
+                id="index-selector",
+                options=[
+                    {"label": f"{info['emoji']} {info['name']} ({info['count']} stocks)", "value": key}
+                    for key, info in SUPPORTED_INDICES.items()
+                ],
+                value=DEFAULT_INDEX,
+                clearable=False,
+                style={
+                    "backgroundColor": "#2a2a2a",
+                    "color": "#fff",
+                    "borderRadius": "5px",
+                },
+                className="custom-dropdown"
+            )
+        ], width=2),
         dbc.Col([
             html.Label("Select Industry:", style={"color": "#00D4FF", "fontWeight": "600", "marginBottom": "5px"}),
             dcc.Dropdown(
@@ -1112,8 +1272,8 @@ app.layout = dbc.Container([
             )
         ], width=2),
         dbc.Col([
-            html.Div(id="update-timestamp", style={"textAlign": "right", "color": "#00D4FF", "fontSize": "0.9rem", "fontWeight": "600", "marginTop": "35px"})
-        ], width=5),
+            html.Div(id="update-timestamp", style={"textAlign": "right", "color": "#00D4FF", "fontSize": "0.8rem", "fontWeight": "600", "marginTop": "35px", "whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"})
+        ], width=3),
     ], className="mb-3"),
     
     # Auto-refresh interval (5 minutes = 300000 ms)
@@ -1129,6 +1289,7 @@ app.layout = dbc.Container([
     dcc.Store(id="current-days", data=10),
     dcc.Store(id="sort-column", data=None),
     dcc.Store(id="sort-direction", data="asc"),
+    dcc.Store(id="selected-index", data=DEFAULT_INDEX),  # Track selected index
     
     dbc.Row([
         dbc.Col([
@@ -1148,22 +1309,28 @@ app.layout = dbc.Container([
 # CALLBACKS
 # -------------------------------------------------------------------
 
-# Callback 1: Load initial symbol-industry mapping (INSTANT NOW!)
+# Callback 1: Load symbol-industry mapping when index changes
 @app.callback(
     [Output("symbol-industry-map", "data"),
-     Output("industry-filter", "options")],
-    Input("industry-filter", "id")
+     Output("industry-filter", "options"),
+     Output("industry-filter", "value"),
+     Output("header-index-name", "children"),
+     Output("selected-index", "data")],
+    Input("index-selector", "value")
 )
-def initialize_data(_):
-    """Load symbol-industry mapping from CSV - INSTANT LOAD!
-    Note: Uses dcc.Store for state management instead of global variable for thread safety.
+def load_index_data(selected_index):
+    """Load symbol-industry mapping for selected index.
+    Uses cached data for efficiency - only fetches from API once per hour.
     """
-    logger.info("Loading pre-generated industry data...")
-    symbol_industry_map = load_symbols_with_industries()
+    if not selected_index:
+        selected_index = DEFAULT_INDEX
+    
+    logger.info(f"Loading index data for {selected_index}...")
+    symbol_industry_map = load_index_with_industries(selected_index)
     
     if not symbol_industry_map:
-        logger.warning("WARNING: No data loaded! Please run fetch_static_data.py first!")
-        return {}, []
+        logger.warning(f"WARNING: No data loaded for {selected_index}!")
+        return {}, [], None, f" - {selected_index}", selected_index
     
     industries = set(symbol_industry_map.values())
     industries.discard("N/A")
@@ -1172,9 +1339,13 @@ def initialize_data(_):
     options = [{"label": "🌐 All Industries", "value": "ALL"}]
     options.extend([{"label": ind, "value": ind} for ind in sorted(industries)])
     
-    logger.info(f"✓ Dropdown ready with {len(options)} options (including 'All')")
+    # Get display name
+    index_info = SUPPORTED_INDICES.get(selected_index, {"name": selected_index})
+    header_text = f" - {index_info['name']}"
     
-    return symbol_industry_map, options
+    logger.info(f"✓ Loaded {len(symbol_industry_map)} stocks for {selected_index} with {len(options)-1} industries")
+    
+    return symbol_industry_map, options, None, header_text, selected_index
 
 
 # Callback 2: Enable/Disable refresh button and auto-refresh
@@ -1250,9 +1421,9 @@ def fetch_industry_data(selected_industry, manual_clicks, auto_intervals, days_i
     # Fetch data with historical comparison
     stocks_data = fetch_stocks_data_for_industry(symbols_in_industry, days_comparison=days_comparison)
     
-    # Create timestamp with source indicator
+    # Create timestamp with source indicator (shortened to fit in column)
     now = datetime.now().strftime("%H:%M:%S")
-    timestamp = f"Last updated: {now} | {len(stocks_data)} stocks | {days_comparison}D comparison | Next refresh: 5 min"
+    timestamp = f"Last Updated: {now} | {len(stocks_data)} stocks | {days_comparison}D | Next ↻ in 5m"
     
     return {selected_industry: stocks_data}, timestamp, days_comparison
 
@@ -1401,7 +1572,7 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
                         html.Span("💡 Tip: ", style={"color": "#FFB800"}),
                         html.Span("Select ", style={"color": "#888"}),
                         html.Span("'🌐 All Industries'", style={"color": "#00D4FF", "fontWeight": "600"}),
-                        html.Span(" to see the complete Nifty 100 aggregate volume indicator", style={"color": "#888"})
+                        html.Span(" to see the complete stocks aggregate volume indicator", style={"color": "#888"})
                     ], style={"textAlign": "center", "fontSize": "0.9rem"})
                 ])
             ], style={
@@ -1533,8 +1704,9 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
         )
 
 
-    # Header
+    # Header - Added S.No as first column
     header_row = html.Tr([
+        html.Th("S.No", style={"backgroundColor": "#00D4FF", "color": "#000", "fontWeight": "700", "padding": "10px", "textAlign": "center", "fontSize": "0.9rem"}),
         create_header("SYMBOL", "SYMBOL", "center"),
         create_header("INDUSTRIES", "INDUSTRIES", "left"),
         create_header("LAST CLOSE", "LAST_CLOSE", "right"),
@@ -1569,7 +1741,10 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
             elif price_change < -2:  # Strong loser (<-2%)
                 row_class = "loser-row"
         
+        # Add Serial Number (starting from 1)
+        serial_no = i + 1
         row = html.Tr([
+            html.Td(serial_no, style={"backgroundColor": row_bg, "padding": "10px 8px", "textAlign": "center", "fontWeight": "600", "color": "#888"}),
             html.Td(stock["SYMBOL"], style={"backgroundColor": row_bg, "padding": "10px 8px", "fontWeight": "700", "color": "#00D4FF", "borderLeft": "3px solid " + ("#00cc66" if row_class == "gainer-row" else "#ff4d4d" if row_class == "loser-row" else "transparent")}),
             html.Td(stock["INDUSTRIES"], style={"backgroundColor": row_bg, "padding": "10px 8px", "fontSize": "0.85rem", "color": "#aaa"}),
             html.Td(format_currency(stock["LAST_DAY_CLOSING_PRICE"]), style={"backgroundColor": row_bg, "padding": "10px 8px", "textAlign": "right"}),

@@ -6,3 +6,4 @@ nsepython
 plotly
 cachetools
 pytz
+niftystocks
