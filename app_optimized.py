@@ -65,6 +65,15 @@ NSE_INDEX_NAMES = {
     "NIFTY100": "NIFTY 100",
 }
 
+# Yahoo Finance tickers for index OHLC data
+INDEX_YF_TICKERS = {
+    "NIFTY50": "^NSEI",      # NIFTY 50 on Yahoo Finance
+    "NIFTY100": "^CNX100",   # NIFTY 100 on Yahoo Finance
+}
+
+# Candlestick chart configuration
+INDEX_CANDLE_DAYS = 60      # 60 days = ~3 months trading, ideal for swing trading analysis
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -80,6 +89,10 @@ volume_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
 # Index constituents cache (long TTL - 1 hour since index composition rarely changes)
 INDEX_CACHE_TTL = 3600  # 1 hour
 index_constituents_cache = TTLCache(maxsize=10, ttl=INDEX_CACHE_TTL)
+
+# Threading lock to prevent concurrent duplicate API calls for same index
+import threading
+_industry_load_lock = threading.Lock()
 
 # -------------------------------------------------------------------
 # SAFETY WRAPPER
@@ -171,11 +184,11 @@ def get_index_constituents(index_name: str) -> list:
     """
     Get list of symbols for an index.
     
-    Data source priority:
-    1. NSE Official API (always up-to-date, authoritative)
-    2. Local CSV file (fallback for offline/error scenarios)
+    Data source: NSE Official API (always up-to-date, authoritative)
     
     Uses caching - only fetches once per hour.
+    This ensures we always have the current index composition,
+    automatically handling delistings, additions, and symbol changes.
     """
     cache_key = f"symbols_{index_name}"
     
@@ -184,37 +197,18 @@ def get_index_constituents(index_name: str) -> list:
         logger.info(f"✓ Using cached {index_name} constituents")
         return index_constituents_cache[cache_key]
     
-    symbols = []
-    
-    # PRIMARY: Try NSE Official API first (authoritative, always current)
+    # Fetch from NSE Official API (authoritative, always current)
     symbols = get_index_constituents_from_nse(index_name)
     
     if symbols:
         # Successfully got symbols from NSE API
         index_constituents_cache[cache_key] = symbols
+        logger.info(f"✓ Loaded {len(symbols)} symbols from NSE API for {index_name}")
         return symbols
     
-    # FALLBACK: Use local CSV file
-    logger.info(f"⚠️ Falling back to CSV for {index_name}")
-    try:
-        csv_file = "nifty100_with_industries.csv" if index_name == "NIFTY100" else "nifty50_with_industries.csv"
-        if not os.path.exists(csv_file):
-            csv_file = "nifty100_with_industries.csv"  # Use nifty100 as default fallback
-        
-        df = pd.read_csv(csv_file)
-        symbols = df["symbol"].tolist()
-        
-        # For Nifty 50, take first 50 if using nifty100 file
-        if index_name == "NIFTY50" and len(symbols) > 50:
-            symbols = symbols[:50]
-        
-        logger.info(f"✓ Loaded {len(symbols)} symbols from CSV fallback for {index_name}")
-        index_constituents_cache[cache_key] = symbols
-        return symbols
-        
-    except Exception as e:
-        logger.error(f"Failed to load index constituents: {e}")
-        return []
+    # If API fails, return empty list (no CSV fallback)
+    logger.error(f"❌ Failed to load {index_name} constituents from NSE API. No data available.")
+    return []
 
 
 def get_symbol_industry(symbol: str) -> str:
@@ -232,53 +226,146 @@ def get_symbol_industry(symbol: str) -> str:
 def load_index_with_industries(index_name: str) -> dict:
     """
     Load symbols with industries for a given index.
-    Uses caching for both symbols and industries.
+    
+    OPTIMIZATION: Since NIFTY 50 is a subset of NIFTY 100, we:
+    1. Load industries for NIFTY 100 first (100 API calls)
+    2. For NIFTY 50, reuse the NIFTY 100 industry mapping (0 API calls)
+    
+    Uses threading lock to prevent concurrent duplicate API calls.
+    This eliminates 50 redundant API calls per startup.
+    
     Returns: {symbol: industry} mapping
     """
     cache_key = f"index_industries_{index_name}"
     
-    # Check cache first
+    # Check cache first (before acquiring lock for efficiency)
     if cache_key in index_constituents_cache:
         logger.info(f"✓ Using cached {index_name} industries mapping")
         return index_constituents_cache[cache_key]
     
-    # Get symbols for the index
-    symbols = get_index_constituents(index_name)
-    if not symbols:
-        return {}
+    # Acquire lock to prevent concurrent duplicate fetches
+    with _industry_load_lock:
+        # Double-check cache after acquiring lock (another thread may have populated it)
+        if cache_key in index_constituents_cache:
+            logger.info(f"✓ Using cached {index_name} industries mapping (after lock)")
+            return index_constituents_cache[cache_key]
     
-    symbol_industry_map = {}
-    
-    # Try to load industries from CSV first (faster)
-    try:
-        csv_file = "nifty100_with_industries.csv"
-        if os.path.exists(csv_file):
-            df = pd.read_csv(csv_file)
-            csv_map = dict(zip(df["symbol"], df["industry"]))
+        # Get symbols for the index from NSE API
+        symbols = get_index_constituents(index_name)
+        if not symbols:
+            return {}
+        
+        symbol_industry_map = {}
+        
+        # OPTIMIZATION: For NIFTY50, try to reuse NIFTY100's industry mapping
+        if index_name == "NIFTY50":
+            nifty100_cache_key = "index_industries_NIFTY100"
             
-            for symbol in symbols:
-                if symbol in csv_map:
-                    symbol_industry_map[symbol] = csv_map[symbol]
-                else:
-                    # Fetch from API for symbols not in CSV
-                    symbol_industry_map[symbol] = get_symbol_industry(symbol)
+            # If NIFTY100 cache doesn't exist, load it first (this ensures optimization always works)
+            if nifty100_cache_key not in index_constituents_cache:
+                logger.info(f"⚡ OPTIMIZATION: Loading NIFTY100 first to reuse for NIFTY50...")
+                # Release lock temporarily to avoid deadlock, then reacquire
+                # Actually we can just call it since it will return from cache check
+                pass
             
-            logger.info(f"✓ Loaded industries for {len(symbol_industry_map)} stocks")
-    except Exception as e:
-        logger.warning(f"CSV industry load failed: {e}. Fetching from API...")
-        # Fallback: fetch all from API (slower)
-        for symbol in symbols:
-            symbol_industry_map[symbol] = get_symbol_industry(symbol)
-    
-    # Cache the result
-    index_constituents_cache[cache_key] = symbol_industry_map
-    return symbol_industry_map
+            # Check again after potential load
+            if nifty100_cache_key not in index_constituents_cache:
+                # Load NIFTY100 within the same lock context (won't deadlock since we check cache first)
+                nifty100_symbols = get_index_constituents("NIFTY100")
+                if nifty100_symbols:
+                    logger.info(f"📡 Fetching industries for {len(nifty100_symbols)} NIFTY100 symbols...")
+                    nifty100_map = {}
+                    for i, symbol in enumerate(nifty100_symbols):
+                        nifty100_map[symbol] = get_symbol_industry(symbol)
+                        if (i + 1) % 25 == 0:
+                            logger.info(f"  Progress: {i + 1}/{len(nifty100_symbols)} industries fetched")
+                    logger.info(f"✓ Loaded industries for {len(nifty100_map)} NIFTY100 stocks")
+                    index_constituents_cache["index_industries_NIFTY100"] = nifty100_map
+            
+            # Now NIFTY100 cache should exist
+            if nifty100_cache_key in index_constituents_cache:
+                nifty100_industries = index_constituents_cache[nifty100_cache_key]
+                logger.info(f"⚡ OPTIMIZATION: Reusing NIFTY100 industries for NIFTY50 (saving 50 API calls)")
+                
+                # Map NIFTY50 symbols using NIFTY100's cached industries
+                missing_symbols = []
+                for symbol in symbols:
+                    if symbol in nifty100_industries:
+                        symbol_industry_map[symbol] = nifty100_industries[symbol]
+                    else:
+                        missing_symbols.append(symbol)
+                
+                # Fetch only missing symbols (rare edge case)
+                if missing_symbols:
+                    logger.info(f"  Fetching {len(missing_symbols)} missing symbols...")
+                    for symbol in missing_symbols:
+                        industry = get_symbol_industry(symbol)
+                        symbol_industry_map[symbol] = industry
+                
+                logger.info(f"✓ Loaded {len(symbol_industry_map)} industries for NIFTY50 (reused from NIFTY100)")
+                index_constituents_cache[cache_key] = symbol_industry_map
+                return symbol_industry_map
+        
+        # Standard path: Fetch industries from NSE API for all symbols
+        logger.info(f"📡 Fetching industries for {len(symbols)} symbols from NSE API...")
+        for i, symbol in enumerate(symbols):
+            industry = get_symbol_industry(symbol)
+            symbol_industry_map[symbol] = industry
+            
+            # Progress log every 25 symbols
+            if (i + 1) % 25 == 0:
+                logger.info(f"  Progress: {i + 1}/{len(symbols)} industries fetched")
+        
+        logger.info(f"✓ Loaded industries for {len(symbol_industry_map)} stocks from NSE API")
+        
+        # Cache the result
+        index_constituents_cache[cache_key] = symbol_industry_map
+        return symbol_industry_map
 
 
 # Legacy function for backward compatibility
 def load_symbols_with_industries():
     """Load symbols and industries - defaults to NIFTY100."""
     return load_index_with_industries(DEFAULT_INDEX)
+
+
+def preload_all_indices():
+    """
+    Preload symbols and industries for ALL supported indices.
+    
+    OPTIMIZATION: Load NIFTY100 first so NIFTY50 can reuse its industry mapping.
+    This reduces total API calls from 150 to just 100.
+    
+    Uses threading to run in background without blocking server startup.
+    """
+    import threading
+    
+    def _preload():
+        logger.info("="*60)
+        logger.info("🚀 PRELOADING ALL INDICES ON STARTUP...")
+        logger.info("="*60)
+        
+        # OPTIMIZED ORDER: Load NIFTY100 first so NIFTY50 can reuse industries
+        preload_order = ["NIFTY100", "NIFTY50"]
+        
+        for index_name in preload_order:
+            if index_name not in SUPPORTED_INDICES:
+                continue
+            logger.info(f"\n📡 Preloading {index_name}...")
+            try:
+                result = load_index_with_industries(index_name)
+                logger.info(f"✓ {index_name}: {len(result)} stocks with industries loaded")
+            except Exception as e:
+                logger.error(f"❌ Failed to preload {index_name}: {e}")
+        
+        logger.info("="*60)
+        logger.info("✅ PRELOAD COMPLETE - All indices ready!")
+        logger.info("="*60)
+    
+    # Run in background thread to not block server startup
+    thread = threading.Thread(target=_preload, daemon=True)
+    thread.start()
+    return thread
 
 
 # Note: Using dcc.Store for state management (thread-safe)
@@ -874,7 +961,173 @@ def create_weekly_turnover_chart(stocks_data):
 
 
 # -------------------------------------------------------------------
-# 8) FETCH DATA FOR SYMBOLS IN SELECTED INDUSTRY
+# 8) INDEX CANDLESTICK CHART
+# -------------------------------------------------------------------
+def create_index_candlestick_chart(index_name: str):
+    """
+    Create a professional candlestick chart for the selected index.
+    Uses Yahoo Finance for OHLC data.
+    
+    Features:
+    - 60-day daily candles for swing trading analysis
+    - 20-day EMA overlay for trend identification
+    - Volume bars at bottom
+    - Professional dark theme styling
+    
+    Args:
+        index_name: "NIFTY50" or "NIFTY100"
+    
+    Returns:
+        dcc.Graph component or None if data unavailable
+    """
+    try:
+        yf_ticker = INDEX_YF_TICKERS.get(index_name)
+        if not yf_ticker:
+            logger.warning(f"No Yahoo Finance ticker for {index_name}")
+            return None
+        
+        # Fetch OHLC data
+        ticker = yf.Ticker(yf_ticker)
+        hist = ticker.history(period=f"{INDEX_CANDLE_DAYS + 10}d", interval="1d")
+        
+        if hist.empty or len(hist) < 10:
+            logger.warning(f"Insufficient data for {index_name} candlestick chart")
+            return None
+        
+        # Take last INDEX_CANDLE_DAYS
+        hist = hist.tail(INDEX_CANDLE_DAYS)
+        
+        # Convert timezone-aware index to timezone-naive for Plotly compatibility
+        hist = hist.reset_index()
+        hist['Date'] = hist['Date'].dt.tz_localize(None)
+        
+        # Format dates for cleaner x-axis labels (e.g., "Dec 14")
+        hist['DateStr'] = hist['Date'].dt.strftime('%b %d')
+        
+        # Calculate 20-day EMA for trend
+        hist['EMA20'] = hist['Close'].ewm(span=20, adjust=False).mean()
+        
+        # Determine trend direction (last close vs EMA)
+        current_close = hist['Close'].iloc[-1]
+        current_ema = hist['EMA20'].iloc[-1]
+        trend_up = current_close > current_ema
+        
+        # Create candlestick figure with subplots (candles + volume)
+        fig = go.Figure()
+        
+        # Candlestick trace
+        fig.add_trace(go.Candlestick(
+            x=hist['DateStr'],
+            open=hist['Open'],
+            high=hist['High'],
+            low=hist['Low'],
+            close=hist['Close'],
+            name=NSE_INDEX_NAMES.get(index_name, index_name),
+            increasing=dict(line=dict(color='#00CC66', width=1), fillcolor='#00CC66'),
+            decreasing=dict(line=dict(color='#FF4D4D', width=1), fillcolor='#FF4D4D'),
+            hoverinfo='x+y+text',
+        ))
+        
+        # 20-day EMA line
+        fig.add_trace(go.Scatter(
+            x=hist['DateStr'],
+            y=hist['EMA20'],
+            name='EMA 20',
+            line=dict(color='#FFB800', width=2, dash='dot'),
+            hovertemplate='EMA20: %{y:,.2f}<extra></extra>'
+        ))
+        
+        # Get display name and calculate change
+        display_name = NSE_INDEX_NAMES.get(index_name, index_name)
+        price_change = current_close - hist['Close'].iloc[0]
+        price_change_pct = (price_change / hist['Close'].iloc[0]) * 100
+        change_color = "#00CC66" if price_change >= 0 else "#FF4D4D"
+        change_symbol = "▲" if price_change >= 0 else "▼"
+        
+        # Update layout with professional styling
+        fig.update_layout(
+            title=dict(
+                text=f"<b>{display_name}</b> <span style='font-size:14px;color:{change_color}'>{change_symbol} {price_change_pct:.2f}% ({INDEX_CANDLE_DAYS}D)</span>",
+                font=dict(size=16, color='#fff'),
+                x=0.02,
+                xanchor='left'
+            ),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(family="Inter, sans-serif", color="#888"),
+            height=320,
+            margin=dict(l=60, r=20, t=50, b=40),
+            xaxis=dict(
+                showgrid=False,
+                showline=True,
+                linecolor='#333',
+                tickfont=dict(size=10, color='#666'),
+                rangeslider=dict(visible=False),
+                type='category',  # Use category to remove weekend/holiday gaps
+                nticks=10,        # Show ~10 date labels to avoid clutter
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridcolor='rgba(50,50,50,0.5)',
+                showline=False,
+                tickformat=',.0f',
+                tickfont=dict(size=10, color='#666'),
+                side='right',
+            ),
+            legend=dict(
+                orientation='h',
+                yanchor='bottom',
+                y=1.02,
+                xanchor='right',
+                x=1,
+                font=dict(size=10, color='#888'),
+                bgcolor='rgba(0,0,0,0)'
+            ),
+            hoverlabel=dict(
+                bgcolor='#1a1a2e',
+                font_size=12,
+                font_family="Inter"
+            ),
+            xaxis_rangeslider_visible=False,
+        )
+        
+        # Add current price annotation
+        fig.add_annotation(
+            x=hist['DateStr'].iloc[-1],
+            y=current_close,
+            text=f"₹{current_close:,.0f}",
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=1,
+            arrowwidth=1,
+            arrowcolor=change_color,
+            ax=40,
+            ay=0,
+            font=dict(size=12, color=change_color, family="Inter"),
+            bgcolor='rgba(26,26,46,0.9)',
+            bordercolor=change_color,
+            borderwidth=1,
+            borderpad=4
+        )
+        
+        chart = dcc.Graph(
+            figure=fig,
+            config={'displayModeBar': False},
+            style={'width': '100%'}
+        )
+        
+        logger.info(f"✓ Created candlestick chart for {index_name}")
+        return chart
+        
+    except Exception as e:
+        logger.error(f"Error creating candlestick chart for {index_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+# -------------------------------------------------------------------
+# 9) FETCH DATA FOR SYMBOLS IN SELECTED INDUSTRY
 # -------------------------------------------------------------------
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -972,7 +1225,8 @@ def fetch_stocks_data_for_industry(symbols, days_comparison=10, batch_size: int 
 app = dash.Dash(
     __name__, 
     external_stylesheets=[dbc.themes.DARKLY],
-    suppress_callback_exceptions=True
+    suppress_callback_exceptions=True,
+    title="Turnexia | Stock Screener"
 )
 
 server = app.server
@@ -1164,6 +1418,60 @@ app.index_string = '''
             @media (max-width: 1200px) {
                 .table-dark { font-size: 0.8rem; }
             }
+            
+            /* ========== ACCORDION STYLES ========== */
+            .accordion {
+                border-radius: 15px !important;
+                overflow: hidden;
+            }
+            
+            .accordion-item {
+                background: transparent !important;
+                border: 1px solid #333 !important;
+                margin-bottom: 10px;
+                border-radius: 12px !important;
+                overflow: hidden;
+            }
+            
+            .accordion-button {
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%) !important;
+                color: #fff !important;
+                font-weight: 700 !important;
+                font-size: 1rem !important;
+                padding: 15px 20px !important;
+                border: none !important;
+                box-shadow: none !important;
+                transition: all 0.3s ease !important;
+            }
+            
+            .accordion-button:not(.collapsed) {
+                background: linear-gradient(135deg, #16213e 0%, #1a1a2e 100%) !important;
+                color: #00D4FF !important;
+                border-bottom: 2px solid #00D4FF !important;
+            }
+            
+            .accordion-button:hover {
+                background: linear-gradient(135deg, #1f2a3e 0%, #1d2138 100%) !important;
+            }
+            
+            .accordion-button::after {
+                filter: invert(1) brightness(2);
+                transition: transform 0.3s ease !important;
+            }
+            
+            .accordion-button:focus {
+                box-shadow: none !important;
+                border-color: #00D4FF !important;
+            }
+            
+            .accordion-body {
+                background: transparent !important;
+                padding: 0 !important;
+            }
+            
+            .accordion-collapse {
+                transition: all 0.3s ease !important;
+            }
         </style>
     </head>
     <body>
@@ -1179,23 +1487,34 @@ app.index_string = '''
 
 app.layout = dbc.Container([
     
-    # Enhanced Header
+    # Enhanced Header with Logo
     html.Div([
-        html.H1([
-            html.Span("📊 ", style={"marginRight": "10px"}),
-            html.Span("AKS Market", style={
-                "background": "linear-gradient(135deg, #00D4FF 0%, #00FF88 50%, #00D4FF 100%)",
-                "backgroundClip": "text",
-                "WebkitBackgroundClip": "text",
-                "WebkitTextFillColor": "transparent",
-                "fontWeight": "800",
-            }),
-            html.Span(id="header-index-name", children=" - NIFTY100", 
-                     style={"color": "#888", "fontWeight": "400", "fontSize": "0.7em"})
-        ], style={"margin": "0", "fontSize": "2.2rem", "letterSpacing": "-1px"}),
+        # Row 1: Logo centered
+        html.Div([
+            html.Img(
+                src="/assets/logo.png",
+                style={
+                    "height": "50px",
+                    "filter": "drop-shadow(0 0 20px rgba(0, 212, 255, 0.5))"
+                }
+            ),
+        ], style={"textAlign": "center", "marginBottom": "10px"}),
+        # Row 2: Index badge + tagline
+        html.Div([
+            html.Span(id="header-index-name", children="NIFTY 100", 
+                     style={
+                         "color": "#00D4FF",
+                         "fontWeight": "500",
+                         "fontSize": "0.75rem",
+                         "padding": "5px 14px",
+                         "borderRadius": "20px",
+                         "background": "rgba(0, 212, 255, 0.1)",
+                         "border": "1px solid rgba(0, 212, 255, 0.3)"
+                     })
+        ], style={"textAlign": "center", "marginBottom": "8px"}),
         html.P("Real-time stock screener with aggregate volume analytics", 
-               style={"color": "#666", "fontSize": "0.9rem", "margin": "5px 0 0 0", "letterSpacing": "0.5px"})
-    ], className="text-center", style={"padding": "20px 0 25px 0"}),
+               style={"color": "#666", "fontSize": "0.85rem", "margin": "0", "letterSpacing": "0.5px", "textAlign": "center"})
+    ], style={"padding": "15px 0 20px 0"}),
     
     dbc.Row([
         # NEW: Index Selector Dropdown
@@ -1297,7 +1616,34 @@ app.layout = dbc.Container([
                 id="loading-1",
                 type="circle",
                 color="#00D4FF",
-                children=html.Div(id="table-container", style={"overflowX": "auto", "minHeight": "200px"})
+                children=html.Div(
+                    id="table-container", 
+                    style={"overflowX": "auto", "minHeight": "200px"},
+                    children=[
+                        # Default welcome content (shown before callbacks run)
+                        html.Div([
+                            html.Div([
+                                html.Img(
+                                    src="/assets/logo_symbol.png",
+                                    style={
+                                        "height": "60px",
+                                        "marginBottom": "15px",
+                                        "display": "block",
+                                        "margin": "0 auto 15px auto",
+                                        "filter": "drop-shadow(0 0 15px rgba(0, 212, 255, 0.4))"
+                                    }
+                                ),
+                                html.H2("Loading...", style={"color": "#fff", "fontWeight": "700", "fontSize": "1.8rem", "marginBottom": "10px"}),
+                                html.P("Preparing your stock analytics dashboard", style={"color": "#888", "fontSize": "1rem"})
+                            ], style={"textAlign": "center", "padding": "60px 20px"})
+                        ], style={
+                            "background": "linear-gradient(180deg, rgba(0,212,255,0.03) 0%, transparent 50%)",
+                            "borderRadius": "15px",
+                            "padding": "40px 20px",
+                            "marginTop": "20px"
+                        })
+                    ]
+                )
             )
         ], width=12),
     ])
@@ -1330,7 +1676,7 @@ def load_index_data(selected_index):
     
     if not symbol_industry_map:
         logger.warning(f"WARNING: No data loaded for {selected_index}!")
-        return {}, [], None, f" - {selected_index}", selected_index
+        return {}, [], None, selected_index, selected_index
     
     industries = set(symbol_industry_map.values())
     industries.discard("N/A")
@@ -1339,9 +1685,9 @@ def load_index_data(selected_index):
     options = [{"label": "🌐 All Industries", "value": "ALL"}]
     options.extend([{"label": ind, "value": ind} for ind in sorted(industries)])
     
-    # Get display name
+    # Get display name for header badge
     index_info = SUPPORTED_INDICES.get(selected_index, {"name": selected_index})
-    header_text = f" - {index_info['name']}"
+    header_text = index_info['name']
     
     logger.info(f"✓ Loaded {len(symbol_industry_map)} stocks for {selected_index} with {len(options)-1} industries")
     
@@ -1464,27 +1810,37 @@ def handle_sort(n_clicks_list, current_column, current_direction):
      Input("industry-filter", "value"),
      Input("current-days", "data"),
      Input("sort-column", "data"),
-     Input("sort-direction", "data")]
+     Input("sort-direction", "data"),
+     Input("selected-index", "data")]  # Added for candlestick chart
 )
-def generate_table(stocks_data_store, selected_industry, days, sort_column, sort_direction):
-    """Generate table with stock data and sorting."""
+def generate_table(stocks_data_store, selected_industry, days, sort_column, sort_direction, selected_index):
+    """Generate table with stock data, candlestick chart, and sorting."""
 
     if not selected_industry:
         return html.Div([
             # Welcome Section
             html.Div([
                 html.Div([
-                    html.Span("🚀", style={"fontSize": "4rem", "marginBottom": "20px", "display": "block"}),
-                    html.H2("Welcome to AKS Market Screener", style={
+                    html.Img(
+                        src="/assets/logo_symbol.png",
+                        style={
+                            "height": "60px",
+                            "marginBottom": "15px",
+                            "display": "block",
+                            "margin": "0 auto 15px auto",
+                            "filter": "drop-shadow(0 0 15px rgba(0, 212, 255, 0.4))"
+                        }
+                    ),
+                    html.H2("Get Started", style={
                         "color": "#fff",
                         "fontWeight": "700",
-                        "fontSize": "2rem",
+                        "fontSize": "1.8rem",
                         "marginBottom": "10px"
                     }),
-                    html.P("Your real-time stock analysis dashboard with aggregate volume insights", style={
+                    html.P("Select an industry to explore real-time stock analytics", style={
                         "color": "#888",
                         "fontSize": "1rem",
-                        "marginBottom": "30px"
+                        "marginBottom": "25px"
                     }),
                     html.Div([
                         html.Span("👆 ", style={"fontSize": "1.2rem"}),
@@ -1787,6 +2143,57 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
     weekly_turnover_chart = create_weekly_turnover_chart(stocks_data)
     print(f"DEBUG weekly_turnover_chart is: {type(weekly_turnover_chart).__name__}, truthy={bool(weekly_turnover_chart)}")
     
+    # ========== INDEX CANDLESTICK CHART ==========
+    index_candlestick_chart = create_index_candlestick_chart(selected_index or DEFAULT_INDEX)
+    print(f"DEBUG index_candlestick_chart: index={selected_index}, chart_type={type(index_candlestick_chart).__name__}, truthy={bool(index_candlestick_chart)}")
+    
+    # Build candlestick chart card
+    # Note: dcc.Graph objects don't evaluate to True in boolean context, so check explicitly
+    if index_candlestick_chart is not None:
+        candlestick_card = dbc.Card([
+            dbc.CardHeader([
+                html.Div([
+                    html.Div([
+                        html.Span("EMA 20", style={
+                            "padding": "4px 12px",
+                            "borderRadius": "15px",
+                            "background": "rgba(255, 184, 0, 0.2)",
+                            "border": "1px solid #FFB800",
+                            "color": "#FFB800",
+                            "fontSize": "0.75rem",
+                            "fontWeight": "600",
+                            "marginRight": "10px"
+                        }),
+                        html.Span(f"{INDEX_CANDLE_DAYS} Days", style={
+                            "padding": "4px 12px",
+                            "borderRadius": "15px",
+                            "background": "rgba(0, 212, 255, 0.2)",
+                            "border": "1px solid #00D4FF",
+                            "color": "#00D4FF",
+                            "fontSize": "0.75rem",
+                            "fontWeight": "600"
+                        })
+                    ], style={"display": "flex", "alignItems": "center"})
+                ], style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"})
+            ], style={
+                "background": "linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)",
+                "borderBottom": "2px solid #FFB800",
+                "padding": "15px 20px"
+            }),
+            dbc.CardBody([
+                index_candlestick_chart
+            ], style={"padding": "15px"})
+        ], style={
+            "background": "linear-gradient(135deg, #12121c 0%, #1a1a2e 50%, #0f0f1a 100%)",
+            "border": "1px solid #333",
+            "borderRadius": "15px",
+            "marginBottom": "20px",
+            "boxShadow": "0 8px 32px rgba(255, 184, 0, 0.1), inset 0 1px 0 rgba(255,255,255,0.05)",
+            "backdropFilter": "blur(10px)"
+        })
+    else:
+        candlestick_card = None
+    
     if vol_indicator:
         # Format the percentage change with proper sign
         vol_pct = vol_indicator["volume_pct_change"]
@@ -1812,19 +2219,6 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
             # Header with animated alert badge
             dbc.CardHeader([
                 html.Div([
-                    html.Div([
-                        html.Span("📊", style={"fontSize": "1.5rem", "marginRight": "12px"}),
-                        html.Span("AGGREGATE VOLUME INDICATOR", style={
-                            "fontSize": "1rem",
-                            "fontWeight": "700",
-                            "letterSpacing": "1px",
-                            "background": "linear-gradient(90deg, #fff 0%, #00D4FF 100%)",
-                            "backgroundClip": "text",
-                            "WebkitBackgroundClip": "text",
-                            "WebkitTextFillColor": "transparent",
-                        }),
-                    ], style={"display": "flex", "alignItems": "center"}),
-                    
                     # Animated alert badge
                     html.Div(
                         vol_indicator["alert_text"],
@@ -2042,12 +2436,52 @@ def generate_table(stocks_data_store, selected_industry, days, sort_column, sort
             "Volume indicator not available - insufficient data",
             style={"color": "#666", "fontSize": "0.9rem", "marginBottom": "15px"}
         )
+    # Build final layout with Accordion for indicator sections
+    accordion_items = []
     
-    return html.Div([volume_indicator_card, count_indicator, table])
+    # Accordion item for INDEX PRICE ACTION
+    if candlestick_card is not None:
+        accordion_items.append(
+            dbc.AccordionItem(
+                candlestick_card,
+                title="📈 INDEX PRICE ACTION",
+                item_id="candlestick-accordion",
+            )
+        )
+    
+    # Accordion item for AGGREGATE VOLUME INDICATOR
+    accordion_items.append(
+        dbc.AccordionItem(
+            volume_indicator_card,
+            title="📊 AGGREGATE VOLUME INDICATOR",
+            item_id="volume-accordion",
+        )
+    )
+    
+    # Create accordion with both sections open by default
+    indicators_accordion = dbc.Accordion(
+        accordion_items,
+        active_item=["candlestick-accordion", "volume-accordion"],  # Both open by default
+        always_open=True,  # Allow multiple sections open at once
+        flush=True,
+        style={
+            "marginBottom": "20px",
+            "--bs-accordion-bg": "transparent",
+            "--bs-accordion-btn-bg": "linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)",
+            "--bs-accordion-active-bg": "transparent",
+            "--bs-accordion-btn-color": "#fff",
+            "--bs-accordion-btn-focus-box-shadow": "none",
+            "--bs-accordion-border-color": "#333",
+        }
+    )
+    
+    return html.Div([indicators_accordion, count_indicator, table])
 
 
 # -------------------------------------------------------------------
 # RUN APP
 # -------------------------------------------------------------------
 if __name__ == "__main__":
+    # Preload all indices on startup for instant switching
+    preload_all_indices()
     app.run(debug=False, port=8051)

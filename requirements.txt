@@ -1,9 +1,30 @@
-dash
-dash-bootstrap-components
-pandas
-yfinance
-nsepython
-plotly
-cachetools
-pytz
-niftystocks
+# AKS Market Screener - NiceGUI Application
+# Dependencies for the stock screener
+
+# Core Framework
+nicegui>=1.4.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Stock Data APIs
+yfinance>=0.2.0
+nsepython>=1.0.0
+
+# Charts
+plotly>=5.0.0
+
+# Caching
+cachetools>=5.0.0
+
+# Configuration
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+
+# Timezone
+pytz>=2023.0
+
+# Utilities (from original)
+niftystocks>=0.1.0
